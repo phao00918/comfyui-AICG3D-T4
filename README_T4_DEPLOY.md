@@ -18,11 +18,9 @@ cd comfyui-AICG3D-T4
 ### 方式 A：Kaggle（推荐，和你现在用的环境一样）
 
 1. Kaggle 上新建私人草稿，选 GPU T4x2、Internet 开。
-2. 先在一个格子里跑：
-   ```bash
-   !git clone https://github.com/phao00918/comfyui-AICG3D-T4.git /kaggle/working/aicg3d-t4-repo
-   ```
-3. 再把本仓库里的 `kaggle_t4.ipynb` 的格子按顺序贴进来（第 1-5 格），
+2. 把本仓库里的 `kaggle_t4.ipynb` 的格子按顺序贴进来（第 1-5 格），
+   第 2 格会自动 clone 本仓库，不用事先手动 clone。
+3. 如果你已经手动 clone 过，也没关系，第 2 格会直接用现成的那个目录。
    不要跳格，不要改配置（normalvram、full、torch 2.11.0+cu130 都是写死的）。
 4. 第 5 格会给出 Cloudflare 隧道 URL，打开就是 ComfyUI。
 
