@@ -1,3 +1,11 @@
+## sm75 轮子版本（2026-11-03 更新）
+
+本仓库现在就是 sm75 轮子版本，不是“官方 Sage + 门控”而已：
+
+- 加载器里的注意力选项新增显式选项 **SageAttention2 sm75 轮子（T4）**，新节点默认就是这一项；旧工作流里选“自动（Sage 优先）”的，在 T4 上也会先试 sm75 轮子。
+- 对接路径已核对：加载器（AICG3D_H3Loader）把 accel.py 的注意力控件合并进自己，load() 转成 AccelConfig 放进 bundle.accel，模型建好后 _LazyH3Model._finish() 调 apply_acceleration()，再由 _apply_attention() 调 model.clone().set_model_optimized_attention(func)。所以改 accel.py 就等于改了加载器的 Sage 行为，加载器本身不用另外改代码；ComfyUI 的 --use-sage-attention 只是全局默认，会被这个按模型补丁覆盖。
+- 选 sm75 轮子必须同时满足：验证标记通过（cos>=0.999、seq4096 提速>=1.2x、torch 2.11.0）且装的确实是 sageattention 2.1.2 + torch 2.11.0+cu130，缺任何一点都明确回落 SDPA，不再把官方 Sage 打到模型上。
+
 # T4（sm75）Sage 修复说明
 
 ## 原问题（一句话）

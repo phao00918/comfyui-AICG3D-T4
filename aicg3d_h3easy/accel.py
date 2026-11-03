@@ -14,6 +14,15 @@ T4/sm75 适配（本仓库的改动，上游没有这一段）：
 * 官方 SageAttention 内核锁死 sm80+，在 T4（sm75）上装了也会静默回落，
   采样时满屏 ``PassManager::run failed``，实际走的是 PyTorch，等于没加速。
   所以本仓库在 sm75 上不再只看“后端有没有注册”就选 Sage。
+* 本仓库版本 = sm75 轮子版本：T4 上默认走 SageAttention2 2.1.2 sm75 轮子，
+  不是官方 SageAttention。加载器对接方式见下。
+* 加载器对接（已核对，不用另外改加载器代码）：加载器节点（AICG3D_H3Loader）
+  把本文件的「注意力加速」控件合并进自己的 INPUT_TYPES（motion_cache=False，
+  只留这一个加速控件），load() 里把控件值转成 AccelConfig 放进 bundle.accel，
+  模型真正建好后由 _LazyH3Model._finish() 调 apply_acceleration()，
+  再由 _apply_attention() 调 model.clone().set_model_optimized_attention(func)。
+  所以改这里就等于改了加载器的 Sage 行为；ComfyUI 启动参数 --use-sage-attention
+  只是全局默认后端，会被这里的按模型补丁覆盖。
 * sm75 上只有同时满足下面三点才选 Sage：装的是 sm75 专用 SageAttention2 2.1.2 轮子、
   torch 是 2.11.0+cu130、且部署脚本跑过的数值+速度验证标记存在且通过
   （cos >= 0.999、seq 4096 提速 >= 1.2x，见仓库根目录 ``scripts/verify_sage_sm75.py``）。
@@ -47,6 +56,7 @@ LOG_PREFIX = "[MiniMax H3 Aicg 加速]"
 MOTION_CACHE_KEY = "aicg3d_h3_motion_cache"
 
 ATTENTION_AUTO = "自动（Sage 优先）"
+ATTENTION_SM75 = "SageAttention2 sm75 轮子（T4）"
 ATTENTION_OFF = "关闭"
 
 # 注意力后端的 (注册表键, 界面显示名)。顺序即"自动"之外的界面顺序。
@@ -90,6 +100,29 @@ def _is_sm75() -> bool:
     cap = _device_capability()
     return cap is not None and cap[0] == 7
 
+
+
+def _sage_wheel_version() -> tuple[str | None, str | None, str]:
+    """返回 (sageattention 版本, torch 版本, 说明)。装的不是 sm75 轮子就说明原因。"""
+    try:
+        import torch
+    except Exception:
+        return None, None, "torch 未安装"
+    torch_ver = getattr(torch, "__version__", "")
+    try:
+        import importlib.metadata
+        sage_ver = importlib.metadata.version("sageattention")
+    except Exception:
+        try:
+            import sageattention
+            sage_ver = getattr(sageattention, "__version__", "unknown")
+        except Exception:
+            return None, torch_ver, "sageattention 未安装"
+    if sage_ver != "2.1.2":
+        return sage_ver, torch_ver, f"sageattention 版本是 {sage_ver}，不是 sm75 轮子的 2.1.2"
+    if not str(torch_ver).startswith(SAGE_SM75_TORCH):
+        return sage_ver, torch_ver, f"torch 版本是 {torch_ver}，sm75 轮子只对应 {SAGE_SM75_TORCH}"
+    return sage_ver, torch_ver, "sm75 轮子版本正确"
 
 def _sage_sm75_marker_verified() -> tuple[bool, str]:
     """sm75 上 Sage 是否经过本仓库的验证。返回 (是否通过, 原因)。"""
@@ -149,7 +182,9 @@ def available_attention_backends() -> list[tuple[str, str]]:
 
 
 def attention_choices() -> list[str]:
-    return [ATTENTION_AUTO, ATTENTION_OFF] + [label for _, label in available_attention_backends()]
+    # sm75 轮子单独列出来：用户在加载器里可以直接点它，不用靠“自动”猜。
+    # 非 T4 机器上点它也会在 resolve 时明确回落 SDPA，不会静默用错。
+    return [ATTENTION_AUTO, ATTENTION_SM75, ATTENTION_OFF] + [label for _, label in available_attention_backends() if label != ATTENTION_SM75]
 
 
 def _label_to_backend(choice: str) -> str | None:
@@ -164,6 +199,22 @@ def resolve_attention_backend(choice: str) -> tuple[str | None, str]:
     choice = (choice or "").strip()
     if choice in ("", ATTENTION_OFF, "关", "False", "false"):
         return None, "注意力加速已关闭"
+    # --- 显式 sm75 轮子选项：这是本仓库的 T4 默认路线 ---
+    if choice == ATTENTION_SM75:
+        if not _is_sm75():
+            return None, "SageAttention2 sm75 轮子只适用于 T4（sm75），当前不是 sm75，已回落到 SDPA"
+        ok, reason = _sage_sm75_marker_verified()
+        if not ok:
+            return None, (
+                f"sm75 轮子未通过验证（{reason}），已回落到 SDPA。"
+                "要开 sm75 轮子请先跑部署第 3 格或 scripts/verify_sage_sm75.py，验证通过后会写验证标记。"
+            )
+        sage_ver, torch_ver, wheel_reason = _sage_wheel_version()
+        if sage_ver != "2.1.2":
+            return None, f"sm75 轮子对接失败（{wheel_reason}），已回落到 SDPA。请按部署脚本重装 2.1.2 轮子 + torch 2.11.0+cu130。"
+        if not _backend_present("sage"):
+            return None, "sm75 轮子已验证，但 ComfyUI 里 sage 后端没注册，保持默认后端（SDPA）"
+        return "sage", f"注意力后端 → SageAttention2 sm75 轮子（T4）：sageattention {sage_ver}，torch {torch_ver}，验证标记通过"
     backend = _label_to_backend(choice)
     if backend is not None:
         if backend in ("sage", "sage3") and _is_sm75():
@@ -174,22 +225,26 @@ def resolve_attention_backend(choice: str) -> tuple[str | None, str]:
                     "已回落到 SDPA，不再把官方 Sage 打到模型上刷 PassManager 错误。"
                     "要开 Sage 请先用仓库里的 scripts/verify_sage_sm75.py 装 sm75 轮子并验证通过。"
                 )
+            sage_ver, _torch_ver, wheel_reason = _sage_wheel_version()
+            if sage_ver != "2.1.2":
+                return None, f"T4（sm75）上 {choice} 对接失败（{wheel_reason}），已回落到 SDPA。"
         if _backend_present(backend):
             return backend, f"注意力后端 → {choice}"
         return None, f"{choice} 当前不可用（依赖没装或后端没注册），保持 ComfyUI 默认后端"
-    # 自动模式：Sage 优先，没有就用 ComfyUI 当前后端。
-    # T4/sm75 例外：只认验证标记，不认“注册了就算可用”，否则官方 Sage 会在
-    # 采样时静默回落并刷满错误日志，等于没加速。
+    # 自动模式：T4/sm75 先试 sm75 轮子，通不过再跳过 Sage 回落 SDPA，不走官方 Sage。
+    if _is_sm75():
+        ok, reason = _sage_sm75_marker_verified()
+        sage_ver, torch_ver, _wheel_reason = _sage_wheel_version()
+        if ok and sage_ver == "2.1.2" and _backend_present("sage"):
+            return "sage", f"注意力后端 → SageAttention2 sm75 轮子（T4，自动选择）：sageattention {sage_ver}，torch {torch_ver}"
+        _log(
+            "T4（sm75）自动模式跳过 Sage：%s，已回落到 SDPA。"
+            "要开 Sage 请先跑 scripts/verify_sage_sm75.py。" % reason
+        )
+        return None, "T4（sm75）自动模式：sm75 轮子未验证，已回落到 SDPA"
+    # 非 sm75：Sage 优先，没有就用 ComfyUI 当前后端。
     for key in _AUTO_PRIORITY:
         if _backend_present(key):
-            if key in ("sage", "sage3") and _is_sm75():
-                ok, reason = _sage_sm75_marker_verified()
-                if not ok:
-                    _log(
-                        "T4（sm75）自动模式跳过 Sage：%s，已回落到 SDPA。"
-                        "要开 Sage 请先跑 scripts/verify_sage_sm75.py。" % reason
-                    )
-                    continue
             label = dict(_ATTENTION_BACKENDS)[key]
             return key, f"注意力后端 → {label}（自动选择）"
     return None, "未检测到可用的 SageAttention，保持 ComfyUI 默认注意力后端（SDPA）"
@@ -316,12 +371,13 @@ def accel_widget_input_types(motion_cache: bool = True) -> dict[str, tuple]:
         ACCEL_WIDGET_NAMES[0]: (
             attention_choices(),
             {
-                "default": ATTENTION_AUTO,
+                "default": ATTENTION_SM75,
                 "tooltip": (
-                    "注意力加速。自动=SageAttention 优先，没装就保持 ComfyUI 当前后端；"
-                    "也可以手动指定 SageAttention3 / FlashAttention / Kitchen INT8 / xFormers 等。"
-                    "T4（sm75）例外：自动和手动选 Sage 都只认本仓库验证过的 sm75 轮子"
-                    "（SageAttention2 2.1.2 + torch 2.11.0+cu130 + 验证标记），否则回落 SDPA，"
+                    "注意力加速。本仓库是 sm75 轮子版本：默认选“SageAttention2 sm75 轮子（T4）”，"
+                    "即 SageAttention2 2.1.2 sm75 轮子 + torch 2.11.0+cu130 + 验证标记，"
+                    "加载器就是用这个选项把 Sage 打到模型上的（见 accel.py 头部对接说明）。"
+                    "自动=SageAttention 优先，在 T4 上自动模式也会先试 sm75 轮子；"
+                    "轮子没装、版本不对或验证没通过时，都会明确回落 SDPA，"
                     "不再用官方 Sage 刷 PassManager 错误。"
                 ),
             },
